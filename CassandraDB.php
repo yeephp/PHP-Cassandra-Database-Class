@@ -15,6 +15,7 @@ class CassandraDB
     protected static $_instance;
     protected $_cluster;
     protected $_session;
+    protected $_keyspace;
     protected $isConnected = false;
 
     /**
@@ -37,6 +38,30 @@ class CassandraDB
      * @var array
      */
     protected $_bindParams = array();
+
+    /**
+     * Boolean - Toggle which defines if the select results will be converted
+     * from Cassandra object to appropriate data type.
+     *
+     * Default: true
+     *
+     * @var boolean
+     */
+    public $autoConvert = true;
+
+    /**
+     * An Array that holds table information as 'column name' => 'column type'
+     *
+     * @var array 
+     */
+    protected $_table = array();
+
+    /**
+     * String that holds the name of the table which is used
+     *
+     * @var string Name of the table
+     */
+    protected $_tableName;
 
     /**
      * Database credentials
@@ -90,6 +115,8 @@ class CassandraDB
 
         $this->_session = $this->_cluster->connect( $this->keyspace );
 
+        $this->_keyspace = $this->_session->schema()->keyspace( $this->keyspace );
+
         $this->isConnected = true;
     }
 
@@ -116,7 +143,7 @@ class CassandraDB
         $this->_groupBy = array();
         $this->_query = null;
         $this->_bindParams = array();
-        $this->count = 0;
+        // $this->count = 0; ------------------------------ To be deleted
     }
 
     /**
@@ -172,6 +199,10 @@ class CassandraDB
 
         $stmt = $this->_buildQuery( $numRows );
 
+        if ( $stmt == false ) {
+            return false;
+        }
+
         if ( $hasWhere = !empty( $this->_bindParams ) ) {
             $bind = $this->_buildBindParams( $this->_bindParams );
         }
@@ -224,6 +255,7 @@ class CassandraDB
 
     /**
      * Insert query. Inserts new data into the table.
+     * (If the new data already exists it will update it)
      *
      * @param <string $tableName The name of the table.
      * @param array $insertData Data containing information for inserting into the DB.
@@ -236,9 +268,19 @@ class CassandraDB
             $this->connect();
         }
 
+        if ( empty( $this->_tableName ) || $this->_tableName != $tableName ) {
+            $this->_tableName = $tableName;
+            $this->_initTable( $this->_keyspace->table( $tableName ) );
+        }
+
         $this->_query = "INSERT INTO " . $tableName;
 
         $stmt = $this->_buildQuery( null, $insertData );
+
+        if ( $stmt == false ) {
+            return false;
+        }
+
         $bind = $this->_buildBindParams( $insertData );
 
         try {
@@ -257,6 +299,7 @@ class CassandraDB
 
     /**
      * Update query. Be sure to first call the "where" method.
+     * (If the primary key doesn't exist it will work like insert)
      *
      * @param string $tableName The name of the database table to work with.
      * @param array  $tableData Array of data to update the desired row.
@@ -269,9 +312,18 @@ class CassandraDB
             $this->connect();
         }
 
+        if ( empty( $this->_tableName ) || $this->_tableName != $tableName ) {
+            $this->_tableName = $tableName;
+            $this->_initTable( $this->_keyspace->table( $tableName ) );
+        }
+
         $this->_query = "UPDATE " . $tableName . " SET ";
 
         $stmt = $this->_buildQuery( null, $tableData );
+
+        if ( $stmt == false ) {
+            return false;
+        }
 
         foreach ( $tableData as $key => $value ) {
             $this->_bindParams[$key] = $value;
@@ -307,9 +359,19 @@ class CassandraDB
             $this->connect();
         }
 
+        if ( empty( $this->_tableName ) || $this->_tableName != $tableName ) {
+            $this->_tableName = $tableName;
+            $this->_initTable( $this->_keyspace->table( $tableName ) );
+        }
+
         $this->_query = "DELETE FROM " . $tableName;
 
         $stmt = $this->_buildQuery( $numRows );
+
+        if ( $stmt == false ) {
+            return false;
+        }
+
         $bind = $this->_buildBindParams( $this->_bindParams );
 
         try {
@@ -544,12 +606,13 @@ class CassandraDB
         }
 
         try {
-            
-            return $this->_session->prepare( $this->_query );
+
+            $stmt = $this->_session->prepare( $this->_query );
+            return $stmt;
         } catch ( Cassandra\Exception $e ) {
 
-            echo $e->getMessage();
-            return Cassandra\Statement;
+            echo '<strong>ERROR - PREPARE STATEMENT</strong>: ' . $e->getMessage();
+            return false;
         }
     }
 
@@ -566,12 +629,14 @@ class CassandraDB
             $this->connect();
         }
 
+        $items = $this->_convertParams( $items );
+
         try {
 
             return new Cassandra\ExecutionOptions( array( 'arguments' => $items ) );
         } catch ( Cassandra\Exception $e ) {
 
-            echo $e->getMessage();
+            echo '<strong>ERROR - BIND</strong>: ' . $e->getMessage();
             return false;
         }
     }
@@ -585,11 +650,155 @@ class CassandraDB
      */
     protected function _extractRows( $result )
     {
-        $arrayResults = array();
-
-        foreach ( $result as $row ) {
-            array_push( $arrayResults, $row );
+        if ( !$this->isConnected ) {
+            $this->connect();
         }
+
+        $arrayResults = array();
+        $keys = array_keys( $result[0] );
+
+        for ( $i = 0; $i < $result->count(); $i++ ) {
+
+            array_push( $arrayResults, $result[$i] );
+
+            if ( $this->autoConvert ) {
+
+                foreach ( $keys as $key ) {
+
+                    if ( !is_string( $arrayResults[$i][$key] ) && !is_int( $arrayResults[$i][$key] ) && !is_double( $arrayResults[$i][$key] ) && !is_null( $arrayResults[$i][$key] ) ) {
+                        $arrayResults[$i][$key] = $this->_convertFromCassandraObject( $arrayResults[$i][$key] );
+                    }
+                }
+            }
+        }
+
         return $arrayResults;
+    }
+
+    /**
+     * Converts from cassandra object to appropriate data format
+     *
+     * @param Cassandra Object
+     *
+     * @return Appropriate data format
+     */
+    protected function _convertFromCassandraObject( $col )
+    {
+        if ( !$this->isConnected ) {
+            $this->connect();
+        }
+
+        if ( $col->type() == 'timestamp' ) {
+            return $col->toDateTime();
+        }
+
+        if ( $col->type() == 'bigint' ) {
+            return $col->toInt();
+        }
+
+        if ( $col->type() == 'decimal' || $col->type() == 'float' ) {
+            return $col->toDouble();
+        }
+
+        if ( $col->type() == 'varint' ) {
+            return $col->value();
+        }
+
+        if ( $col->type() == 'blob' ) {
+            return $col->bytes();
+        }
+
+        if ( $col->type() == 'uuid' || $col->type() == 'timeuuid' ) {
+            return $col->uuid();
+        }
+
+        if ( $col->type() == 'inet' ) {
+            return $col->address();
+        }
+    }
+
+    /**
+     * Initializes the table information
+     * 'column name' => 'column type'
+     *
+     * @param object Cassandra\DefaultTable
+     *
+     */
+    protected function _initTable( $table )
+    {
+        $this->_table = array();
+
+        foreach ( $table->columns() as $column ) {
+            $this->_table[$column->name()] = $column->type();
+        }
+    }
+
+    /**
+     * Loops through all parameters which will be converted
+     * to appropriate Cassandra object type
+     *
+     * @param array     Parameters prior conversion
+     *
+     * @return array    Parameters after conversion
+     */
+    protected function _convertParams( $params )
+    {
+        foreach ( array_keys( $params ) as $paramKey ) {
+            $params[$paramKey] = $this->_convertToCassandraObject( $params[$paramKey], $paramKey );
+        }
+
+        return $params;
+    }
+
+    /**
+     * Converts the parameter value of the column
+     * to the appropriate Cassandra object type
+     *
+     * @param object Value of the parameter
+     * @param string Column name of the parameter
+     *
+     * @return object New cassandra object OR the old value
+     */
+    protected function _convertToCassandraObject( $paramValue, $paramKey )
+    {
+        if ( $this->_table[$paramKey] == 'int' || $this->_table[$paramKey] == 'varchar' || $this->_table[$paramKey] == 'double' ) {
+            return $paramValue;
+        }
+
+        if ( $this->_table[$paramKey] == 'timestamp' ) {
+            return new Cassandra\Timestamp( strtotime( $paramValue ) );
+        }
+
+        if ( $this->_table[$paramKey] == 'bigint' ) {
+            return new Cassandra\Bigint( $paramValue );
+        }
+
+        if ( $this->_table[$paramKey] == 'decimal' ) {
+            return new Cassandra\Decimal( strval( $paramValue ) );
+        }
+
+        if ( $this->_table[$paramKey] == 'float' ) {
+            return new Cassandra\Float( strval( $paramValue ) );
+        }
+
+        if ( $this->_table[$paramKey] == 'varint' ) {
+            return new Cassandra\Varint( $paramValue );
+        }
+
+        if ( $this->_table[$paramKey] == 'blob' ) {
+            return new Cassandra\Blob( $paramValue );
+        }
+
+        if ( $this->_table[$paramKey] == 'uuid' ) {
+            return new Cassandra\Uuid();
+        }
+
+        if ( $this->_table[$paramKey] == 'timeuuid' ) {
+            return new Cassandra\Timeuuid();
+        }
+
+        if ( $this->_table[$paramKey] == 'inet' ) {
+            return new Cassandra\Inet( $paramValue );
+        }
     }
 }
