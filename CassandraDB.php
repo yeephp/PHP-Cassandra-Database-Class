@@ -207,7 +207,7 @@ class CassandraDB
         if ( $stmt == false ) {
             return false;
         }
-
+       
         $arguments = $this->_buildExecutionOptions( $this->_bindParams, $options );
 
         try {
@@ -218,7 +218,6 @@ class CassandraDB
             echo $e->getMessage();
             return false;
         }
-
 
         $this->reset();
 
@@ -238,7 +237,7 @@ class CassandraDB
             $this->connect();
         }
 
-        $res = $this->get( $tableName, 1, $columns );
+        $res = $this->get( $tableName, 1, $columns , 0);
 
         if ( is_object( $res ) )
             return $res;
@@ -394,13 +393,11 @@ class CassandraDB
 
         $this->_bindParams[$whereProp] = $whereValue;
 
-        if ( $operator ) {
-            $whereValue = Array( $operator => $whereValue );
+        $whereValue = Array( $operator => $whereValue );
 
-            $this->_where[] = Array( "AND", $whereValue, $whereProp );
+        $this->_where[] = Array( "AND", $whereValue, $whereProp );
 
-            return $this;
-        }
+        return $this;
     }
     /**
      * Creates Cassandra bind on parameters
@@ -556,7 +553,7 @@ class CassandraDB
                 continue;
 
             // Simple = comparison
-            if ( !is_array( $wValue ) )
+            if ( key( $wValue ) == "" )
                 $wValue = Array( '=' => $wValue );
 
             $key = key( $wValue );
@@ -672,6 +669,7 @@ class CassandraDB
      */
     protected function _extractResult( $excutionResult, $hasPages = false )
     {
+        
         if ( $hasPages ) {
             return $this->_extractRowsInPages( $excutionResult );
         }
