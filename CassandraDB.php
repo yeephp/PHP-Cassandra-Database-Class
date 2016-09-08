@@ -75,15 +75,13 @@ class CassandraDB
     protected $keyspace;
 
     /**
-     * Constructor assigning the new credentials.
-     *
      * @param string $seed_nodes
      * @param integer $port
      * @param string $cas_username
      * @param string $cas_pass
      * @param string $keyspace
      */
-    public function __construct( $seed_nodes, $cas_username, $cas_pass, $port, $keyspace )
+    public function __construct($seed_nodes, $cas_username, $cas_pass, $port, $keyspace)
     {
         $this->seeds = $seed_nodes;
         $this->username = $cas_username;
@@ -96,24 +94,25 @@ class CassandraDB
 
     /**
      * A method to connect to the DatabaseManager
+     *
      */
     public function connect()
     {
 
         $this->_cluster = Cassandra::cluster()
-                ->withContactPoints( implode( ',', $this->seeds ) );
+                ->withContactPoints(implode(',', $this->seeds));
 
-        if ( $this->username != '' && $this->password != '' ) {
-            $this->_cluster = $this->_cluster->withCredentials( $this->username, $this->password );
+        if ($this->username != '' && $this->password != '') {
+            $this->_cluster = $this->_cluster->withCredentials($this->username, $this->password);
         }
 
-        if ( $this->port != '' ) {
-            $this->_cluster = $this->_cluster->withPort( $this->port );
+        if ($this->port != '') {
+            $this->_cluster = $this->_cluster->withPort($this->port);
         }
 
         $this->_cluster = $this->_cluster->build();
 
-        $this->_session = $this->_cluster->connect( $this->keyspace );
+        $this->_session = $this->_cluster->connect($this->keyspace);
 
         $this->_keyspace = $this->_session->schema()->keyspace( $this->keyspace );
 
@@ -143,7 +142,6 @@ class CassandraDB
         $this->_groupBy = array();
         $this->_query = null;
         $this->_bindParams = array();
-        // $this->count = 0; ------------------------------ To be deleted
     }
 
     /**
@@ -160,7 +158,6 @@ class CassandraDB
         }
 
         try {
-
             $stmt = new Cassandra\SimpleStatement( $query );
             $result = $this->_session->execute( $stmt );
         } catch ( Cassandra\Exception $e ) {
@@ -170,7 +167,11 @@ class CassandraDB
         }
 
         if ( $result->count() > 0 ) {
-            return $this->_extractRows( $result );
+            $arrayResults = array();
+            foreach ( $result as $row ) {
+                array_push( $arrayResults, $row );
+            }
+            return $arrayResults;
         }
 
         return true;
@@ -184,14 +185,18 @@ class CassandraDB
      *
      * @return array Contains the returned rows from the select query.
      */
-    public function get( $tableName, $numRows = null, $columns = '*' )
+    public function get( $tableName, $numRows = null, $columns = '*', $options = 0 )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        if ( empty( $columns ) ) {
+        if ( empty( $columns ))
             $columns = '*';
+
+        if ( empty( $this->_tableName ) || $this->_tableName != $tableName ) {
+                $this->_tableName = $tableName;
+                $this->_initTable( $this->_keyspace->table( $tableName ) );
         }
 
         $column = is_array( $columns ) ? implode( ', ', $columns ) : $columns;
@@ -203,28 +208,22 @@ class CassandraDB
             return false;
         }
 
-        if ( $hasWhere = !empty( $this->_bindParams ) ) {
-            $bind = $this->_buildBindParams( $this->_bindParams );
-        }
+        $arguments = $this->_buildExecutionOptions( $this->_bindParams, $options );
 
         try {
 
-            if ( $hasWhere ) {
-
-                $result = $this->_session->execute( $stmt, $bind );
-            } else {
-
-                $result = $this->_session->execute( $stmt );
-            }
+            $result = $this->_session->execute( $stmt, $arguments );
+            
         } catch ( Exception $e ) {
 
             echo $e->getMessage();
             return false;
         }
 
+
         $this->reset();
 
-        return $this->_extractRows( $result );
+        return $this->_extractResult( $result, $options > 0 );
     }
 
     /**
@@ -242,20 +241,16 @@ class CassandraDB
 
         $res = $this->get( $tableName, 1, $columns );
 
-        if ( is_object( $res ) ) {
+        if ( is_object( $res ))
             return $res;
-        }
 
-        if ( isset( $res[0] ) ) {
+        if ( isset( $res[0] ))
             return $res[0];
-        }
 
         return null;
     }
 
     /**
-     * Insert query. Inserts new data into the table.
-     * (If the new data already exists it will update it)
      *
      * @param <string $tableName The name of the table.
      * @param array $insertData Data containing information for inserting into the DB.
@@ -267,7 +262,7 @@ class CassandraDB
         if ( !$this->isConnected ) {
             $this->connect();
         }
-
+        var_dump( $this->_tableName );
         if ( empty( $this->_tableName ) || $this->_tableName != $tableName ) {
             $this->_tableName = $tableName;
             $this->_initTable( $this->_keyspace->table( $tableName ) );
@@ -281,13 +276,12 @@ class CassandraDB
             return false;
         }
 
-        $bind = $this->_buildBindParams( $insertData );
+        $arguments = $this->_buildExecutionOptions( $insertData );
 
         try {
 
-            $result = $this->_session->execute( $stmt, $bind );
+            $result = $this->_session->execute( $stmt, $arguments );
         } catch ( Cassandra\Exception $e ) {
-
             echo $e->getMessage();
             return false;
         }
@@ -299,7 +293,6 @@ class CassandraDB
 
     /**
      * Update query. Be sure to first call the "where" method.
-     * (If the primary key doesn't exist it will work like insert)
      *
      * @param string $tableName The name of the database table to work with.
      * @param array  $tableData Array of data to update the desired row.
@@ -329,13 +322,12 @@ class CassandraDB
             $this->_bindParams[$key] = $value;
         }
 
-        $bind = $this->_buildBindParams( $this->_bindParams );
+        $arguments = $this->_buildExecutionOptions( $this->_bindParams );
 
         try {
 
-            $result = $this->_session->execute( $stmt, $bind );
+            $result = $this->_session->execute( $stmt, $arguments );
         } catch ( Cassandra\Exception $e ) {
-
             echo $e->getMessage();
             return false;
         }
@@ -372,11 +364,11 @@ class CassandraDB
             return false;
         }
 
-        $bind = $this->_buildBindParams( $this->_bindParams );
+        $arguments = $this->_buildExecutionOptions( $this->_bindParams );
 
         try {
 
-            $this->_session->execute( $stmt, $bind );
+            $this->_session->execute( $stmt, $arguments );
         } catch ( Cassandra\Exception $e ) {
             echo $e->getMessage();
             return false;
@@ -401,13 +393,56 @@ class CassandraDB
             $this->connect();
         }
 
+        $this->_bindParams[$whereProp] = $whereValue;
+
         if ( $operator ) {
             $whereValue = Array( $operator => $whereValue );
-        }
 
         $this->_where[] = Array( "AND", $whereValue, $whereProp );
-        $this->_bindParams[$whereProp] = $whereValue;
+
         return $this;
+    }
+
+    /**
+     * Creates Cassandra bind on parameters
+     *
+     * @param array
+     *
+     * @return object 
+     */
+    protected function _buildBindParams( $items )
+    {
+        if ( !$this->isConnected ) {
+            $this->connect();
+        }
+
+        try {
+
+            return new Cassandra\ExecutionOptions( array( 'arguments' => $items ));
+        } catch ( Cassandra\Exception $e ) {
+
+            echo $e->getMessage();
+            return false;
+        }
+    }
+
+    /**
+     * Helper function to add variables into bind parameters array and will return
+     * its CQL part of the query according to operator in ' $operator ?'
+     *
+     * @param Array Variable with values
+     */
+    protected function _buildPair($operator, $value)
+    {
+        if (!$this->isConnected) {
+            $this->connect();
+        }
+
+        if (!is_object($value)) {
+            return ' ' . $operator . ' ? ';
+        }
+
+        return " " . $operator . " (" . $subQuery['query'] . ")";
     }
 
     /**
@@ -445,25 +480,23 @@ class CassandraDB
             $this->connect();
         }
 
-        if ( !is_array( $tableData ) ) {
+        if ( !is_array( $tableData ))
             return;
-        }
 
         $isInsert = strpos( $this->_query, 'INSERT' );
         $isUpdate = strpos( $this->_query, 'UPDATE' );
 
-        if ( $isInsert !== false ) {
-            $this->_query .= ' (' . implode( array_keys( $tableData ), ', ' ) . ')';
+        if ($isInsert !== false) {
+            $this->_query .= ' (' . implode( array_keys( $tableData ), ', ') . ')';
             $this->_query .= ' VALUES (';
         }
 
         foreach ( $tableData as $column => $value ) {
-            if ( $isUpdate !== false ) {
+            if ( $isUpdate !== false )
                 $this->_query .= " " . $column . " = ";
-            }
 
             // Simple value - extract parameters to be binded
-            if ( !is_array( $value ) ) {
+            if ( !is_array( $value )) {
                 $this->_query .= '?, ';
                 continue;
             }
@@ -477,23 +510,22 @@ class CassandraDB
                     break;
                 case '[F]':
                     $this->_query .= $val[0] . ", ";
-                    if ( !empty( $val[1] ) )
+                    if (!empty($val[1]))
                         break;
                 case '[N]':
-                    if ( $val == null )
+                    if ($val == null)
                         $this->_query .= "!" . $column . ", ";
                     else
                         $this->_query .= "!" . $val . ", ";
                     break;
                 default:
-                    die( "Wrong operation" );
+                    die("Wrong operation");
             }
         }
         $this->_query = rtrim( $this->_query, ', ' );
 
-        if ( $isInsert !== false ) {
+        if ( $isInsert !== false )
             $this->_query .= ')';
-        }
     }
 
     /**
@@ -505,9 +537,8 @@ class CassandraDB
             $this->connect();
         }
 
-        if ( empty( $this->_where ) ) {
+        if ( empty( $this->_where ))
             return;
-        }
 
         //Prepair the where portion of the query
         $this->_query .= ' WHERE ';
@@ -520,19 +551,17 @@ class CassandraDB
             $this->_query .= " " . $concat . " " . $wKey;
 
             // Empty value (raw where condition in wKey)
-            if ( $wValue === null ) {
+            if ( $wValue === null )
                 continue;
-            }
 
             // Simple = comparison
-            if ( !is_array( $wValue ) ) {
-                $wValue = Array( '=' => $wValue );
-            }
+            if ( !is_array( $wValue ))
+                $wValue = Array('=' => $wValue );
 
             $key = key( $wValue );
             $val = $wValue[$key];
 
-            switch ( strtolower( $key ) ) {
+            switch ( strtolower( $key )) {
                 case '0':
                     break;
                 case 'not in':
@@ -541,7 +570,7 @@ class CassandraDB
                     foreach ( $val as $v ) {
                         $comparison .= ' ?,';
                     }
-                    $this->_query .= rtrim( $comparison, ',' ) . ' ) ';
+                    $this->_query .= rtrim( $comparison, ',') . ' ) ';
                     break;
                 case 'not between':
                 case 'between':
@@ -551,25 +580,6 @@ class CassandraDB
                     $this->_query .= $this->_buildPair( $key, $val );
             }
         }
-    }
-
-    /**
-     * Helper function to add variables into bind parameters array and will return
-     * its CQL part of the query according to operator in ' $operator ?'
-     *
-     * @param Array Variable with values
-     */
-    protected function _buildPair( $operator, $value )
-    {
-        if ( !$this->isConnected ) {
-            $this->connect();
-        }
-
-        if ( !is_object( $value ) ) {
-            return ' ' . $operator . ' ? ';
-        }
-
-        return " " . $operator . " (" . $subQuery['query'] . ")";
     }
 
     /**
@@ -583,15 +593,13 @@ class CassandraDB
             $this->connect();
         }
 
-        if ( !isset( $numRows ) ) {
+        if ( !isset( $numRows ))
             return;
-        }
 
-        if ( is_array( $numRows ) ) {
+        if ( is_array($numRows ))
             $this->_query .= ' LIMIT ' . (int) $numRows[0] . ', ' . (int) $numRows[1];
-        } else {
+        else
             $this->_query .= ' LIMIT ' . (int) $numRows;
-        }
     }
 
     /**
@@ -617,23 +625,33 @@ class CassandraDB
     }
 
     /**
-     * Creates a Cassandra bind on parameters
+     * Creates a Cassandra Execution Options object.
+     * 
+     * @param array Arguments which will be prepared for binding.
+     * @param int   Number of items which will be dislayed in a single page.
      *
-     * @param array
-     *
-     * @return object 
+     * @return object Cassandra ExecutionOptions
      */
-    protected function _buildBindParams( $items )
+    protected function _buildExecutionOptions( $arguments = array(), $paging = 0 )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        $items = $this->_convertParams( $items );
+        $executionOptionsArray = array ();
+
+        if ( !empty( $arguments ) ){
+            $executionOptionsArray[ 'arguments' ] = $this->_convertArgumentsToCassandra( $arguments );
+        }
+
+        if($paging > 0){
+            $executionOptionsArray[ 'page_size' ] = $paging;
+        }
+
 
         try {
 
-            return new Cassandra\ExecutionOptions( array( 'arguments' => $items ) );
+            return new Cassandra\ExecutionOptions( $executionOptionsArray );
         } catch ( Cassandra\Exception $e ) {
 
             echo '<strong>ERROR - BIND</strong>: ' . $e->getMessage();
@@ -642,37 +660,117 @@ class CassandraDB
     }
 
     /**
-     * Extracts all rows from the executed Cassandra statement
+     * Returns the result from the Cassandra executed query.
+     * Either in rows or in pages.
+     *
+     * @param object    Cassandra\Rows
+     * @param boolean   Pages are set or not set
+     *
+     * @return array|null All rows from the executed statement OR 'null' if there are no results.
+     *
+     */
+    protected function _extractResult( $excutionResult, $hasPages = false )
+    {
+        if ( $hasPages ){
+            return $this->_extractRowsInPages( $excutionResult );
+        }
+
+        return $this->_extractRows( $excutionResult );
+    }
+
+    /**
+     * Extracts all rows in pages from the executed Cassandra statement
      *
      * @param object Cassandra executed statement
      *
-     * @return array All rows from the executed statement
+     * @return array|null All rows in pages from the executed statement OR 'null' if there are no results.
      */
-    protected function _extractRows( $result )
+    protected function _extractRowsInPages( $executionResult )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        $arrayResults = array();
-        $keys = array_keys( $result[0] );
+        if ( $executionResult->count() == 0 ) {
+            return null;
+        }
 
-        for ( $i = 0; $i < $result->count(); $i++ ) {
+        $convertedResults = array();
 
-            array_push( $arrayResults, $result[$i] );
+        //Get column names
+        $cols = array_keys( $executionResult[0] );
+
+        //Current page
+        $page = 0;
+
+        while ( true ){
+
+            $convertedResults[$page] = array();
+
+            for ( $row = 0; $row < $executionResult->count(); $row++ ) {
+
+                array_push( $convertedResults[$page], $executionResult[$row] );
+
+                if ( $this->autoConvert ) {
+
+                    foreach ( $cols as $col ) {
+                        
+                        if ( gettype( $convertedResults[$page][$row][$col] ) == 'object' ) {
+                            $convertedResults[$page][$row][$col] = $this->_convertFromCassandraObject( $convertedResults[$page][$row][$col] );                            
+                        }
+                    }
+                } 
+            }
+
+            if ($executionResult->isLastPage()) {
+              break;
+            }
+
+            $executionResult = $executionResult->nextPage();
+            $page++;
+        }
+
+        return $convertedResults;
+    }
+
+    /**
+     * Extracts all rows from the executed Cassandra statement
+     *
+     * @param object Cassandra executed statement
+     *
+     * @return array|null All rows from the executed statement OR 'null' if there are no results.
+     */
+    protected function _extractRows( $executionResult )
+    {
+        if ( !$this->isConnected ) {
+            $this->connect();
+        }
+
+        if ( $executionResult->count() == 0 ) {
+            return null;
+        }
+
+        $convertedResults = array();
+
+        //Get column names
+        $cols = array_keys( $executionResult[0] );
+
+        for ( $row = 0; $row < $executionResult->count(); $row++ ) {
+
+            array_push( $convertedResults, $executionResult[$row] );
 
             if ( $this->autoConvert ) {
 
-                foreach ( $keys as $key ) {
-
-                    if ( !is_string( $arrayResults[$i][$key] ) && !is_int( $arrayResults[$i][$key] ) && !is_double( $arrayResults[$i][$key] ) && !is_null( $arrayResults[$i][$key] ) ) {
-                        $arrayResults[$i][$key] = $this->_convertFromCassandraObject( $arrayResults[$i][$key] );
+                foreach ( $cols as $col ) {
+                    
+                    if ( gettype( $convertedResults[$row][$col] ) == 'object' ) {
+                        $convertedResults[$row][$col] = $this->_convertFromCassandraObject( $convertedResults[$row][$col] );                            
                     }
                 }
-            }
+            } 
         }
 
-        return $arrayResults;
+        return $convertedResults;
     }
 
     /**
@@ -688,32 +786,23 @@ class CassandraDB
             $this->connect();
         }
 
-        if ( $col->type() == 'timestamp' ) {
-            return $col->toDateTime();
-        }
-
-        if ( $col->type() == 'bigint' ) {
-            return $col->toInt();
-        }
-
-        if ( $col->type() == 'decimal' || $col->type() == 'float' ) {
-            return $col->toDouble();
-        }
-
-        if ( $col->type() == 'varint' ) {
-            return $col->value();
-        }
-
-        if ( $col->type() == 'blob' ) {
-            return $col->bytes();
-        }
-
-        if ( $col->type() == 'uuid' || $col->type() == 'timeuuid' ) {
-            return $col->uuid();
-        }
-
-        if ( $col->type() == 'inet' ) {
-            return $col->address();
+        switch ( $col->type() ) {
+            case 'timestamp':
+                return $col->toDateTime();
+            case 'bigint':
+                return $col->toInt();
+            case 'decimal':
+            case 'float':
+                return $col->toDouble();
+            case 'varint':
+                return $col->value();
+            case 'blob':
+                return $col->bytes();
+            case 'uuid':
+            case 'timeuuid':
+                return $col->uuid();
+            case 'inet':
+                return $col->address();
         }
     }
 
@@ -737,68 +826,55 @@ class CassandraDB
      * Loops through all parameters which will be converted
      * to appropriate Cassandra object type
      *
-     * @param array     Parameters prior conversion
+     * @param array     Arguments prior conversion
      *
-     * @return array    Parameters after conversion
+     * @return array    Arguments after conversion to Cassandra Objects
      */
-    protected function _convertParams( $params )
+    protected function _convertArgumentsToCassandra( $arguments )
     {
-        foreach ( array_keys( $params ) as $paramKey ) {
-            $params[$paramKey] = $this->_convertToCassandraObject( $params[$paramKey], $paramKey );
+        foreach ( array_keys( $arguments ) as $argumentColumn ) {
+
+            $arguments[ $argumentColumn ] = $this->_convertToCassandraObject( $arguments[ $argumentColumn ], $argumentColumn );
         }
 
-        return $params;
+        return $arguments;
     }
 
     /**
-     * Converts the parameter value of the column
-     * to the appropriate Cassandra object type
+     * Converts an argument value from the arguments passes through the query
+     * to the appropriate Cassandra object type based on the type of the column in the table.
      *
-     * @param object Value of the parameter
-     * @param string Column name of the parameter
+     * Called upon insert, update query
      *
-     * @return object New cassandra object OR the old value
+     * @param object Value of the argument from the query
+     * @param string Column name of the argument
+     *
+     * @return object New cassandra object OR the value itself
      */
     protected function _convertToCassandraObject( $paramValue, $paramKey )
     {
-        if ( $this->_table[$paramKey] == 'int' || $this->_table[$paramKey] == 'varchar' || $this->_table[$paramKey] == 'double' ) {
-            return $paramValue;
-        }
 
-        if ( $this->_table[$paramKey] == 'timestamp' ) {
-            return new Cassandra\Timestamp( strtotime( $paramValue ) );
-        }
-
-        if ( $this->_table[$paramKey] == 'bigint' ) {
-            return new Cassandra\Bigint( $paramValue );
-        }
-
-        if ( $this->_table[$paramKey] == 'decimal' ) {
-            return new Cassandra\Decimal( strval( $paramValue ) );
-        }
-
-        if ( $this->_table[$paramKey] == 'float' ) {
-            return new Cassandra\Float( strval( $paramValue ) );
-        }
-
-        if ( $this->_table[$paramKey] == 'varint' ) {
-            return new Cassandra\Varint( $paramValue );
-        }
-
-        if ( $this->_table[$paramKey] == 'blob' ) {
-            return new Cassandra\Blob( $paramValue );
-        }
-
-        if ( $this->_table[$paramKey] == 'uuid' ) {
-            return new Cassandra\Uuid();
-        }
-
-        if ( $this->_table[$paramKey] == 'timeuuid' ) {
-            return new Cassandra\Timeuuid();
-        }
-
-        if ( $this->_table[$paramKey] == 'inet' ) {
-            return new Cassandra\Inet( $paramValue );
+        switch ( $this->_table[$paramKey] ) {
+            case 'timestamp':
+                return new Cassandra\Timestamp( strtotime( $paramValue ) );
+            case 'bigint':
+                return new Cassandra\Bigint( $paramValue );
+            case 'decimal':
+                return new Cassandra\Decimal( strval( $paramValue ) );
+            case 'float':
+                return new Cassandra\Float( strval( $paramValue ) );
+            case 'varint':
+                return new Cassandra\Varint( $paramValue );
+            case 'blob':
+                return new Cassandra\Blob( $paramValue );
+            case 'uuid':
+                return new Cassandra\Uuid();
+            case 'timeuuid':
+                return new Cassandra\Timeuuid();
+            case 'inet':
+                return new Cassandra\Inet( $paramValue );
+            default:
+                return $paramValue;
         }
     }
 }
