@@ -19,6 +19,23 @@ class CassandraDB
     protected $isConnected = false;
 
     /**
+     * Boolean - Toggle which defines if the select results will be converted
+     * from Cassandra object to appropriate data type.
+     *
+     * Default: true
+     *
+     * @var boolean
+     */
+    public $autoConvert = true;
+
+    /**
+     * Uuid of the last insert
+     * 
+     * @var string
+     */
+    protected $_uuid;
+
+    /**
      * The CQL query to be prepared and executed
      *
      * @var string
@@ -37,17 +54,7 @@ class CassandraDB
      *
      * @var array
      */
-    protected $_bindParams = array();
-
-    /**
-     * Boolean - Toggle which defines if the select results will be converted
-     * from Cassandra object to appropriate data type.
-     *
-     * Default: true
-     *
-     * @var boolean
-     */
-    public $autoConvert = true;
+    protected $_argumentsToBind = array();
 
     /**
      * An Array that holds table information as 'column name' => 'column type'
@@ -57,11 +64,11 @@ class CassandraDB
     protected $_table = array();
 
     /**
-     * String that holds the name of the table which is used
+     * Array with all query options which will be used in the query itself
      *
-     * @var string Name of the table
+     * @var array
      */
-    protected $_tableName;
+    protected $_queryOptions = array();
 
     /**
      * Database credentials
@@ -76,9 +83,9 @@ class CassandraDB
 
     /**
      * @param string $seed_nodes
-     * @param integer $port
      * @param string $cas_username
      * @param string $cas_pass
+     * @param integer $port
      * @param string $keyspace
      */
     public function __construct( $seed_nodes, $cas_username, $cas_pass, $port, $keyspace )
@@ -94,7 +101,6 @@ class CassandraDB
 
     /**
      * A method to connect to the DatabaseManager
-     *
      */
     public function connect()
     {
@@ -139,9 +145,15 @@ class CassandraDB
     protected function reset()
     {
         $this->_where = array();
-        $this->_groupBy = array();
         $this->_query = null;
-        $this->_bindParams = array();
+        $this->_queryOptions = array();
+        $this->_argumentsToBind = array();
+        $this->_table = array();
+    }
+
+    public function uuid()
+    {
+        return $this->_uuid->uuid();
     }
 
     /**
@@ -162,16 +174,12 @@ class CassandraDB
             $result = $this->_session->execute( $stmt );
         } catch ( Cassandra\Exception $e ) {
 
-            echo $e->getMessage();
+            $this->_getErrors( $e, "RAW QUERY" );
             return false;
         }
 
         if ( $result->count() > 0 ) {
-            $arrayResults = array();
-            foreach ( $result as $row ) {
-                array_push( $arrayResults, $row );
-            }
-            return $arrayResults;
+            return $this->_extractRows( $result );
         }
 
         return true;
@@ -185,43 +193,44 @@ class CassandraDB
      *
      * @return array Contains the returned rows from the select query.
      */
-    public function get( $tableName, $numRows = null, $columns = '*', $options = 0 )
+    public function get( $tableName, $numRows = null, $columns = '*', $itemsPerPage = 0 )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        if ( empty( $columns ) )
+        if ( empty( $columns ) ) {
             $columns = '*';
-
-        if ( empty( $this->_tableName ) || $this->_tableName != $tableName ) {
-            $this->_tableName = $tableName;
-            $this->_initTable( $this->_keyspace->table( $tableName ) );
         }
+        
+        $this->_getTableInfo( $this->_keyspace->table( $tableName ) );
 
-        $column = is_array( $columns ) ? implode( ', ', $columns ) : $columns;
-        $this->_query = "SELECT $column FROM " . $tableName;
+        $columns = is_array( $columns ) ? implode( ', ', $columns ) : $columns;
+        $this->_query = "SELECT $columns FROM " . $tableName;
 
         $stmt = $this->_buildQuery( $numRows );
 
+        //Check if query has failed
         if ( $stmt == false ) {
             return false;
         }
-       
-        $arguments = $this->_buildExecutionOptions( $this->_bindParams, $options );
+
+        $executionOptions = $this->_buildExecutionOptions( null, $itemsPerPage );
 
         try {
-
-            $result = $this->_session->execute( $stmt, $arguments );
+            $result = $this->_session->execute( $stmt, $executionOptions );
         } catch ( Exception $e ) {
-
-            echo $e->getMessage();
+            $this->_getErrors( $e, 'SELECT EXECUTION' );
             return false;
         }
 
         $this->reset();
 
-        return $this->_extractResult( $result, $options > 0 );
+        if ( $itemsPerPage > 0 ) {
+            return $this->_extractRowsInPages( $result );
+        }
+
+        return $this->_extractRows( $result );
     }
 
     /**
@@ -237,15 +246,7 @@ class CassandraDB
             $this->connect();
         }
 
-        $res = $this->get( $tableName, 1, $columns , 0);
-
-        if ( is_object( $res ) )
-            return $res;
-
-        if ( isset( $res[0] ) )
-            return $res[0];
-
-        return null;
+        return $this->get( $tableName, 1, $columns, 0 );
     }
 
     /**
@@ -255,37 +256,35 @@ class CassandraDB
      *
      * @return boolean Boolean indicating whether the insert query was completed succesfully.
      */
-    public function insert( $tableName, $insertData )
+    public function insert( $tableName, $insertData, $options = null )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        if ( empty( $this->_tableName ) || $this->_tableName != $tableName ) {
-            $this->_tableName = $tableName;
-            $this->_initTable( $this->_keyspace->table( $tableName ) );
-        }
+        $this->_getTableInfo( $this->_keyspace->table( $tableName ) );
+
+        $this->_prepareQueryOptions( $options );
 
         $this->_query = "INSERT INTO " . $tableName;
 
-        $stmt = $this->_buildQuery( null, $insertData );
+        $stmt = $this->_buildBindQuery( $insertData, true );
 
+        //Check if query has failed
         if ( $stmt == false ) {
             return false;
         }
 
-        $arguments = $this->_buildExecutionOptions( $insertData );
+        $arguments = $this->_buildExecutionOptions( $this->_argumentsToBind );
 
         try {
-
             $result = $this->_session->execute( $stmt, $arguments );
         } catch ( Cassandra\Exception $e ) {
-            echo $e->getMessage();
+            $this->_getErrors( $e, "INSERT EXECUTION" );
             return false;
         }
 
         $this->reset();
-
         return true;
     }
 
@@ -297,41 +296,35 @@ class CassandraDB
      *
      * @return boolean
      */
-    public function update( $tableName, $tableData )
+    public function update( $tableName, $tableData, $options = null )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        if ( empty( $this->_tableName ) || $this->_tableName != $tableName ) {
-            $this->_tableName = $tableName;
-            $this->_initTable( $this->_keyspace->table( $tableName ) );
-        }
+        $this->_getTableInfo( $this->_keyspace->table( $tableName ) );
 
-        $this->_query = "UPDATE " . $tableName . " SET ";
+        $this->_prepareQueryOptions( $options );
 
-        $stmt = $this->_buildQuery( null, $tableData );
+        $this->_query = "UPDATE " . $tableName;
 
+        $stmt = $this->_buildBindQuery( $tableData, false );
+
+        //Check if query has failed
         if ( $stmt == false ) {
             return false;
         }
 
-        foreach ( $tableData as $key => $value ) {
-            $this->_bindParams[$key] = $value;
-        }
-
-        $arguments = $this->_buildExecutionOptions( $this->_bindParams );
+        $arguments = $this->_buildExecutionOptions( $this->_argumentsToBind );
 
         try {
-
             $result = $this->_session->execute( $stmt, $arguments );
         } catch ( Cassandra\Exception $e ) {
-            echo $e->getMessage();
+            $this->_getErrors( $e, "UPDATE EXECUTION" );
             return false;
         }
 
         $this->reset();
-
         return true;
     }
 
@@ -343,37 +336,35 @@ class CassandraDB
      *
      * @return boolean 
      */
-    public function delete( $tableName, $numRows = null )
+    public function delete( $tableName, $columns = null, $options = null )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
+        
+        $this->_getTableInfo( $this->_keyspace->table( $tableName ) );
 
-        if ( empty( $this->_tableName ) || $this->_tableName != $tableName ) {
-            $this->_tableName = $tableName;
-            $this->_initTable( $this->_keyspace->table( $tableName ) );
-        }
+        $columns = is_array( $columns ) ? implode( ', ', $columns ) : $columns;
 
-        $this->_query = "DELETE FROM " . $tableName;
+        $this->_query = "DELETE $columns FROM " . $tableName;
 
-        $stmt = $this->_buildQuery( $numRows );
+        $this->_prepareQueryOptions( $options );
 
+        $stmt = $this->_buildQuery( null );
+
+        //Check if query has failed
         if ( $stmt == false ) {
             return false;
         }
 
-        $arguments = $this->_buildExecutionOptions( $this->_bindParams );
-
         try {
-
-            $this->_session->execute( $stmt, $arguments );
+            $this->_session->execute( $stmt );
         } catch ( Cassandra\Exception $e ) {
-            echo $e->getMessage();
+            $this->_getErrors( $e, "DELETE EXECUTION" );
             return false;
         }
 
         $this->reset();
-
         return true;
     }
 
@@ -385,199 +376,130 @@ class CassandraDB
      *
      * @return CassandraDb
      */
-    public function where( $whereProp, $whereValue = null, $operator = null )
+    public function where( $whereColumns, $whereValues, $operator = "=", $options = null )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        $this->_bindParams[$whereProp] = $whereValue;
+        $this->_prepareQueryOptions( $options );
 
-        $whereValue = Array( $operator => $whereValue );
-
-        $this->_where[] = Array( "AND", $whereValue, $whereProp );
+        $this->_where[] = Array( $whereColumns, $whereValues, $operator );
 
         return $this;
     }
-    /**
-     * Creates Cassandra bind on parameters
-     *
-     * @param array
-     *
-     * @return object 
-     */
-    /*
-      protected function _buildBindParams( $items )
-      {
-      if ( !$this->isConnected ) {
-      $this->connect();
-      }
-
-      try {
-
-      return new Cassandra\ExecutionOptions( array( 'arguments' => $items ));
-      } catch ( Cassandra\Exception $e ) {
-
-      echo $e->getMessage();
-      return false;
-      }
-      }
-     */
 
     /**
-     * Helper function to add variables into bind parameters array and will return
-     * its CQL part of the query according to operator in ' $operator ?'
+     * Method which will build the query statement.
+     * This method will create placeholders (?) for binding arguments.
+     * Build INSERT and UPDATE clause.
      *
-     * @param Array Variable with values
-     */
-    protected function _buildPair( $operator, $value )
-    {
-        if ( !$this->isConnected ) {
-            $this->connect();
-        }
-
-        if ( !is_object( $value ) ) {
-            return ' ' . $operator . ' ? ';
-        }
-
-        return " " . $operator . " (" . $subQuery['query'] . ")";
-    }
-
-    /**
-     * Abstraction method that will compile the WHERE statement,
-     * any passed update data, and the desired rows.
-     * It then builds the CQL query.
-     *
-     * @param int   $numRows   The number of rows total to return.
      * @param array $tableData Should contain an array of data for updating the database.
      *
-     * @return cassandra_stmt Returns the $stmt object.
+     * @return object Returns Cassandra\PreparedStatement object.
      */
-    protected function _buildQuery( $numRows = null, $tableData = null )
+    protected function _buildBindQuery( $tableData = null, $isInsert )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        $this->_buildTableData( $tableData );
-        $this->_buildWhere();
-        $this->_buildLimit( $numRows );
+        if ( $isInsert == false ) {
+            //Handle UPADTE option TTL or TIMESTAMP
+            $this->_buildOptionTtlAndTimestamp( $isInsert );
+        }
 
-        // Prepare query
-        $stmt = $this->_prepareQuery();
+        $this->_buildTableData( $tableData, $isInsert );
+        $this->_buildWhere();
+
+        //Handle UPDATE option IF
+        if ( $isInsert === false ) {
+            $this->_buildOptionIf();
+        }
+
+        //Handle INSERT|UPDATE option IF EXISTS
+        $this->_buildOptionExists( $isInsert );
+
+        //Handle INSERT option TTL and TIMESTAMP
+        if ( $isInsert === true ) {
+            $this->_buildOptionTtlAndTimestamp( $isInsert );
+        }
+
+        //Handle WHERE option ALLOW FILTERING
+        $this->_buildOptionAllowFiltering();
+
+        $stmt = $this->_buildQueryStatement();
 
         return $stmt;
     }
 
     /**
+     * Method which will build the query statement.
+     * This method will NOT create any placeholders (?) for binding arguments.
+     * Build WHERE and LIMIT clause.
+     *
+     * @param int   $numRows   The number of rows total to return.
+     *
+     * @return object Returns Cassandra\PreparedStatement object.
+     */
+    protected function _buildQuery( $numRows )
+    {
+        //Handle DELETE option TIMESTAMP
+        $this->_buildOptionTtlAndTimestamp( false );
+
+        $this->_buildWhere();
+        $this->_buildLimit( $numRows );
+
+        //Handle DELETE option IF
+        $this->_buildOptionIf();
+
+        //Handle DELETE option IF EXISTS
+        $this->_buildOptionExists( false );
+
+        //Handle WHERE option ALLOW FILTERING
+        $this->_buildOptionAllowFiltering();
+
+        return $this->_buildQueryStatement( true );
+    }
+
+    /**
      * Abstraction method that will build an INSERT or UPDATE part of the query
      */
-    protected function _buildTableData( $tableData )
+    protected function _buildTableData( $tableData, $isInsert )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        if ( !is_array( $tableData ) )
-            return;
-
-        $isInsert = strpos( $this->_query, 'INSERT' );
-        $isUpdate = strpos( $this->_query, 'UPDATE' );
-
-        if ( $isInsert !== false ) {
+        if ( $isInsert === true ) {
             $this->_query .= ' (' . implode( array_keys( $tableData ), ', ' ) . ')';
             $this->_query .= ' VALUES (';
+        } else {
+            $this->_query .= ' SET';
         }
 
         foreach ( $tableData as $column => $value ) {
-            if ( $isUpdate !== false )
-                $this->_query .= " " . $column . " = ";
 
-            // Simple value - extract parameters to be binded
+            //Insert arguments for binding
+            $this->_argumentsToBind[$column] = $value;
+
+            if ( $isInsert === false ) {
+                $this->_query .= " " . $column . " = ";
+            }
+
             if ( !is_array( $value ) ) {
                 $this->_query .= '?, ';
                 continue;
             }
 
-            // Function value
-            $key = key( $value );
-            $val = $value[$key];
-            switch ( $key ) {
-                case '[I]':
-                    $this->_query .= $column . $val . ", ";
-                    break;
-                case '[F]':
-                    $this->_query .= $val[0] . ", ";
-                    if ( !empty( $val[1] ) )
-                        break;
-                case '[N]':
-                    if ( $val == null )
-                        $this->_query .= "!" . $column . ", ";
-                    else
-                        $this->_query .= "!" . $val . ", ";
-                    break;
-                default:
-                    die( "Wrong operation" );
-            }
+            $this->_query .= " {" . str_repeat( "?,", count( $value ) );
+            $this->_query = rtrim( $this->_query, ',' );
+            $this->_query .= '}, ';
         }
         $this->_query = rtrim( $this->_query, ', ' );
 
-        if ( $isInsert !== false )
+        if ( $isInsert === true )
             $this->_query .= ')';
-    }
-
-    /**
-     * Abstraction method that will build the part of the WHERE conditions
-     */
-    protected function _buildWhere()
-    {
-        if ( !$this->isConnected ) {
-            $this->connect();
-        }
-
-        if ( empty( $this->_where ) )
-            return;
-
-        //Prepair the where portion of the query
-        $this->_query .= ' WHERE ';
-
-        // Remove first AND/OR concatenator
-        $this->_where[0][0] = '';
-        foreach ( $this->_where as $cond ) {
-            list ( $concat, $wValue, $wKey ) = $cond;
-
-            $this->_query .= " " . $concat . " " . $wKey;
-
-            // Empty value (raw where condition in wKey)
-            if ( $wValue === null )
-                continue;
-
-            // Simple = comparison
-            if ( key( $wValue ) == "" )
-                $wValue = Array( '=' => $wValue );
-
-            $key = key( $wValue );
-            $val = $wValue[$key];
-
-            switch ( strtolower( $key ) ) {
-                case '0':
-                    break;
-                case 'not in':
-                case 'in':
-                    $comparison = ' ' . $key . ' (';
-                    foreach ( $val as $v ) {
-                        $comparison .= ' ?,';
-                    }
-                    $this->_query .= rtrim( $comparison, ',' ) . ' ) ';
-                    break;
-                case 'not between':
-                case 'between':
-                    $this->_query .= " $key ? AND ? ";
-                    break;
-                default:
-                    $this->_query .= $this->_buildPair( $key, $val );
-            }
-        }
     }
 
     /**
@@ -591,33 +513,211 @@ class CassandraDB
             $this->connect();
         }
 
-        if ( !isset( $numRows ) )
-            return;
-
-        if ( is_array( $numRows ) )
-            $this->_query .= ' LIMIT ' . (int) $numRows[0] . ', ' . (int) $numRows[1];
-        else
+        if ( isset( $numRows ) ) {
             $this->_query .= ' LIMIT ' . (int) $numRows;
+        }
     }
 
     /**
-     * Method attempts to prepare the CQL query
-     *
-     * @return cassandra_stmt
+     * Abstraction method that will build the part of the WHERE conditions
      */
-    protected function _prepareQuery()
+    protected function _buildWhere()
+    {
+        if ( !$this->isConnected ) {
+            $this->connect();
+        }
+
+        if ( empty( $this->_where ) ) {
+            return;
+        }
+        
+        //Filter function variable
+        $filter = function($v){
+            return is_string($v)? "'$v'" : $v;
+        };
+
+        for ( $row = 0; $row < count( $this->_where ); $row++ ) {
+
+            if ( $row == 0 ) {
+                $this->_query .= " WHERE";
+            } else {
+                $this->_query .= " AND";
+            }
+
+            list ( $col, $val, $operator ) = $this->_where[$row];
+
+            if ( is_array( $col ) ) {
+                $this->_query .= " (" . implode( ", ", $col ) . ") ";
+            } else {
+                $this->_query .= " $col ";
+            }
+
+            $this->_query .= $operator;
+
+            if ( is_array( $val ) ) {
+                //check if the values are arrays
+                if ( is_array( $val[0] ) ) {
+                    //filter the values
+                    for ( $i = 0; $i < count( $val ); $i++ ) {
+                        $val[$i] = array_map($filter, $val[$i]);
+                        $val[$i] = "(" . implode( ", ", $val[$i] ) . ")";
+                    }
+                }
+                //Filter all $val
+                $val = array_map( $filter, $val);
+                $this->_query .= " (" . implode( ", ", $val ) . ") ";
+            } else {
+                if($this->_table[$col]->name() != 'uuid'){
+                    $this->_query .= " " . ( is_string( $val ) ? "'$val'" : $val ) . " ";
+                } else {
+                    $this->_query .= " " .  $val . " ";
+                }
+            }
+        }
+    }
+
+    /**
+     * Builds the 'ALLOW FILTERING' option in the query
+     */
+    protected function _buildOptionAllowFiltering()
+    {
+        if ( array_key_exists( 'ALLOW FILTERING', $this->_queryOptions ) == false ) {
+            return;
+        }
+
+        $this->_query .= " ALLOW FILTERING";
+    }
+
+    /**
+     * Builds the 'IF NOT EXISTS' or 'IF EXISTS' option in the query
+     * 
+     * @param boolean $isInsert TRUE -> builds the proper option for insert
+     */
+    protected function _buildOptionExists( $isInsert )
+    {
+        if ( array_key_exists( 'IF EXISTS', $this->_queryOptions ) == false && array_key_exists( 'IF NOT EXISTS', $this->_queryOptions ) == false ) {
+            return;
+        }
+
+        if ( $isInsert ) {
+            $this->_query .= " IF NOT EXISTS";
+        } else {
+            $this->_query .= " IF EXISTS";
+        }
+    }
+
+    /**
+     * Builds the 'IF' ... 'AND' option in the query
+     */
+    protected function _buildOptionIf()
+    {
+        if ( array_key_exists( "IF", $this->_queryOptions ) == false ) {
+            return;
+        }
+
+        $parameters = $this->_queryOptions['IF'];
+
+        for ( $item = 0; $item < count( $parameters ); $item++ ) {
+            if ( $item == 0 ) {
+                $this->_query .= ' IF ' . key( $parameters[$item] ) . ' = ' . $parameters[$item][key( $parameters[$item] )];
+            } else {
+                $this->_query .= ' AND ' . key( $parameters[$item] ) . ' = ' . $parameters[$item][key( $parameters[$item] )];
+            }
+        }
+    }
+
+    protected function _buildOptionTtlAndTimestamp( $isInsert )
+    {
+        $hasOptionTTL = array_key_exists( 'TTL', $this->_queryOptions );
+        $hasOptionTimestamp = array_key_exists( 'TIMESTAMP', $this->_queryOptions );
+        if ( $hasOptionTTL == false && $hasOptionTimestamp == false ) {
+            return;
+        }
+
+        if ( $isInsert == true ) {
+            if ( $hasOptionTTL && $hasOptionTimestamp ) {
+                $this->_query .= ' USING TTL ' . $this->_queryOptions['TTL'] . ' AND ' . $this->_queryOptions['TIMESTAMP'];
+                return;
+            }
+
+            if ( $hasOptionTTL ) {
+                $this->_query .= ' USING TTL ' . $this->_queryOptions['TTL'];
+                return;
+            }
+            if ( $hasOptionTimestamp ) {
+                $this->_query .= ' USING TIMESTAMP ' . $this->_queryOptions['TIMESTAMP'];
+                return;
+            }
+        } else {
+            if ( $hasOptionTTL == true ) {
+                $this->_query .= ' USING TTL ' . $this->_queryOptions['TTL'];
+            } else {
+                $this->_query .= ' USING TIMESTAMP ' . $this->_queryOptions['TIMESTAMP'];
+            }
+        }
+    }
+
+    /**
+     * Sorts and prepares all options which have been passed from the main query functions
+     * 
+     * @param string|array $options All options which have been passed from the query
+     */
+    protected function _prepareQueryOptions( $options )
+    {
+        if ( $options == null ) {
+            return;
+        }
+
+        if ( is_array( $options ) ) {
+
+            foreach ( $options as $option => $parameters ) {
+
+                /* Handle options without parameters */
+                if ( false === is_string( $option ) ) {
+                    $this->_queryOptions[strtoupper( $parameters )] = null;
+                    continue;
+                }
+
+                /* Handle options with single parameter */
+                if ( false === is_array( $parameters ) ) {
+                    $this->_queryOptions[strtoupper( $option )] = $parameters;
+                    continue;
+                }
+
+                /* Handle options with multiple parameters */
+                $fixedParameters = array();
+                foreach ( $parameters as $param ) {
+                    $col = key( $param );
+                    $fixedParameters[] = [ $col => is_string( $param[$col] ) ? "'" . $param[$col] . "'" : $param[$col] ];
+                }
+                $this->_queryOptions[strtoupper( $option )] = $fixedParameters;
+                unset( $fixedParameters );
+            }
+        } else {
+            $this->_queryOptions[strtoupper( $options )] = null;
+        }
+    }
+
+    /**
+     * Method creates a Cassandra Statement object from the CQL query
+     * 
+     * @param boolean $simpleStatement TRUE -> The method will return Cassandra\SimpleStatement
+     *
+     * @return object   Cassandra\PreparedStatement | Cassandra\SimpleStatement
+     */
+    protected function _buildQueryStatement( $simpleStatement = false )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
         try {
-
-            $stmt = $this->_session->prepare( $this->_query );
-            return $stmt;
+            if ( $simpleStatement ) {
+                return new Cassandra\SimpleStatement( $this->_query );
+            }
+            return $this->_session->prepare( $this->_query );
         } catch ( Cassandra\Exception $e ) {
-
-            echo '<strong>ERROR - PREPARE STATEMENT</strong>: ' . $e->getMessage();
+            $this->_getErrors( $e, "BUILD QUERY STATEMENT" );
             return false;
         }
     }
@@ -630,51 +730,29 @@ class CassandraDB
      *
      * @return object Cassandra ExecutionOptions
      */
-    protected function _buildExecutionOptions( $arguments = array(), $paging = 0 )
+    protected function _buildExecutionOptions( $arguments = array(), $itemsPerPage = 0 )
     {
         if ( !$this->isConnected ) {
             $this->connect();
         }
 
-        $executionOptionsArray = array();
+        //array holding the execution options
+        $executionOptions = array();
 
         if ( !empty( $arguments ) ) {
-            $executionOptionsArray['arguments'] = $this->_convertArgumentsToCassandra( $arguments );
+            $executionOptions['arguments'] = $this->_convertArgumentsToCassandra( $arguments );
         }
 
-        if ( $paging > 0 ) {
-            $executionOptionsArray['page_size'] = $paging;
+        if ( $itemsPerPage > 0 ) {
+            $executionOptions['page_size'] = $itemsPerPage;
         }
-
 
         try {
-
-            return new Cassandra\ExecutionOptions( $executionOptionsArray );
+            return new Cassandra\ExecutionOptions( $executionOptions );
         } catch ( Cassandra\Exception $e ) {
-
-            echo '<strong>ERROR - BIND</strong>: ' . $e->getMessage();
+            $this->_getErrors( $e, "BUILD EXECUTION OPTIONS" );
             return false;
         }
-    }
-
-    /**
-     * Returns the result from the Cassandra executed query.
-     * Either in rows or in pages.
-     *
-     * @param object    Cassandra\Rows
-     * @param boolean   Pages are set or not set
-     *
-     * @return array|null All rows from the executed statement OR 'null' if there are no results.
-     *
-     */
-    protected function _extractResult( $excutionResult, $hasPages = false )
-    {
-        
-        if ( $hasPages ) {
-            return $this->_extractRowsInPages( $excutionResult );
-        }
-
-        return $this->_extractRows( $excutionResult );
     }
 
     /**
@@ -752,15 +830,15 @@ class CassandraDB
         $convertedResults = array();
 
         //Get column names
-        $cols = array_keys( $executionResult[0] );
+        $columnNames = array_keys( $executionResult[0] );
 
         for ( $row = 0; $row < $executionResult->count(); $row++ ) {
 
             array_push( $convertedResults, $executionResult[$row] );
-
+            //Default set to true
             if ( $this->autoConvert ) {
 
-                foreach ( $cols as $col ) {
+                foreach ( $columnNames as $col ) {
 
                     if ( gettype( $convertedResults[$row][$col] ) == 'object' ) {
                         $convertedResults[$row][$col] = $this->_convertFromCassandraObject( $convertedResults[$row][$col] );
@@ -806,16 +884,13 @@ class CassandraDB
     }
 
     /**
-     * Initializes the table information
+     * Gets the table information from the database
      * 'column name' => 'column type'
      *
      * @param object Cassandra\DefaultTable
-     *
      */
-    protected function _initTable( $table )
+    protected function _getTableInfo( $table )
     {
-        $this->_table = array();
-
         foreach ( $table->columns() as $column ) {
             $this->_table[$column->name()] = $column->type();
         }
@@ -832,10 +907,8 @@ class CassandraDB
     protected function _convertArgumentsToCassandra( $arguments )
     {
         foreach ( array_keys( $arguments ) as $argumentColumn ) {
-
             $arguments[$argumentColumn] = $this->_convertToCassandraObject( $arguments[$argumentColumn], $argumentColumn );
         }
-
         return $arguments;
     }
 
@@ -867,13 +940,37 @@ class CassandraDB
             case 'blob':
                 return new Cassandra\Blob( $paramValue );
             case 'uuid':
-                return new Cassandra\Uuid();
+                if ( $paramValue != null ) {
+                    $this->_uuid = new Cassandra\Uuid( $paramValue );
+                } else {
+                    $this->_uuid = new Cassandra\Uuid();
+                }
+                return $this->_uuid;
             case 'timeuuid':
-                return new Cassandra\Timeuuid();
+                if ( $paramValue != null ) {
+                    $this->_uuid = new Cassandra\Timeuuid( $paramValue );
+                } else {
+                    $this->_uuid = new Cassandra\Timeuuid();
+                }
+                return $this->_uuid;
             case 'inet':
                 return new Cassandra\Inet( $paramValue );
             default:
                 return $paramValue;
         }
+    }
+
+    /**
+     * Function which prints the errors if one occurs
+     * 
+     * @param type $e   Cassandra Exception
+     * @param type $from Where the error is coming from
+     */
+    protected function _getErrors( $e, $from )
+    {
+        echo "<p style='font-size: 16pt'><strong>ERROR - $from</strong>: " . $e->getMessage() . "</p>";
+        echo "<h4>Error occured in CassandraDB line: " . $e->getLine() . "</h4> ";
+        echo "<h1>Error backtrace from CassandraDB: </h1>";
+        echo implode( "<br>", explode( "#", $e->getTraceAsString() ) );
     }
 }
